@@ -1,0 +1,126 @@
+%% Autoencoder Anomaly Detection - BASE MATLAB ONLY (no toolboxes needed)
+% A small autoencoder (written from scratch) is trained ONLY on normal
+% vibration spectra. Faults reconstruct badly -> high error -> alarm.
+% Compared against a PCA baseline. Needs MATLAB R2016b or newer.
+
+clear; clc; close all; rng(7);
+if ~exist('results','dir'), mkdir('results'); end
+
+fs = 5000;  winLen = 1000;  nBins = 128;  hidden = 16;
+nTrain = 400;  nVal = 100;  nTestN = 150;  nTestF = 150;
+
+%% 1. Data (columns = samples): spectra of vibration windows
+Xtrain = eab_set(1,   nTrain, winLen, fs, nBins);
+Xval   = eab_set(1,   nVal,   winLen, fs, nBins);
+Xtest  = [eab_set(1, nTestN, winLen, fs, nBins), ...
+          eab_set([3 2], nTestF, winLen, fs, nBins)];
+yTest  = [false(1,nTestN), true(1,nTestF)];           % true = fault
+
+% z-score using NORMAL training data only
+mu = mean(Xtrain,2);  sg = std(Xtrain,0,2) + 1e-6;
+Ztrain = (Xtrain - mu)./sg;  Zval = (Xval - mu)./sg;  Ztest = (Xtest - mu)./sg;
+
+%% 2. Autoencoder trained on normal data only
+ae = eab_trainAE(Ztrain, hidden, 1500);
+errAE = @(Z) mean((Z - eab_reconAE(ae, Z)).^2, 1);
+
+%% 3. PCA baseline (same number of components)
+[U,~,~] = svd(Ztrain, 'econ');
+Uk = U(:,1:hidden);
+errPCA = @(Z) mean((Z - Uk*(Uk'*Z)).^2, 1);
+
+%% 4. Threshold = 99th percentile of validation (normal) errors
+tAE  = eab_pick(errAE(Zval),  0.99);
+tPCA = eab_pick(errPCA(Zval), 0.99);
+eAE = errAE(Ztest);   eP = errPCA(Ztest);
+mAE = eab_eval(eAE > tAE,  yTest);
+mP  = eab_eval(eP   > tPCA, yTest);
+aucAE = eab_auc(eAE, yTest);   aucP = eab_auc(eP, yTest);
+
+fprintf('\n%-14s %10s %8s %8s %8s\n', 'Method', 'Precision', 'Recall', 'F1', 'AUC');
+fprintf('%-14s %10.3f %8.3f %8.3f %8.3f\n', 'Autoencoder', mAE.p, mAE.r, mAE.f1, aucAE);
+fprintf('%-14s %10.3f %8.3f %8.3f %8.3f\n', 'PCA baseline', mP.p, mP.r, mP.f1, aucP);
+fid = fopen(fullfile('results','anomaly_metrics.csv'), 'w');
+fprintf(fid, 'Method,Precision,Recall,F1,AUC\n');
+fprintf(fid, 'Autoencoder,%.3f,%.3f,%.3f,%.3f\n', mAE.p, mAE.r, mAE.f1, aucAE);
+fprintf(fid, 'PCA,%.3f,%.3f,%.3f,%.3f\n', mP.p, mP.r, mP.f1, aucP);
+fclose(fid);
+
+%% 5. Plots
+figure;
+histogram(eAE(~yTest), 30); hold on; histogram(eAE(yTest), 30);
+yl = ylim;  plot([tAE tAE], yl, 'r--', 'LineWidth', 1.5);
+legend('Normal','Fault','Threshold'); xlabel('Reconstruction error');
+ylabel('Count'); title('Autoencoder reconstruction error'); grid on;
+saveas(gcf, fullfile('results','error_histogram.png'));
+
+%% ---------------- Local functions ----------------
+function S = eab_set(types, n, winLen, fs, nBins)
+    S = zeros(nBins, n);
+    for k = 1:n
+        ci = types(mod(k-1, numel(types)) + 1);
+        x  = eab_signal(ci, winLen, fs);
+        Y  = abs(fft(x - mean(x)))/winLen;
+        S(:,k) = Y(2:nBins+1).';
+    end
+end
+
+function sig = eab_signal(ci, n, fs)      % 1 normal, 2 imbalance, 3 bearing
+    tt = (0:n-1)/fs;
+    f0 = 48 + 4*rand;
+    sig = (0.4 + 0.2*rand)*sin(2*pi*f0*tt + 2*pi*rand) + 0.05*randn(1,n);
+    if ci == 2
+        sig = sig*(1.3 + 0.5*rand) + 0.15*sin(2*pi*2*f0*tt);
+    elseif ci == 3
+        sig = sig + 0.08*randn(1,n);
+        for idx = randi(n-20, 1, randi([3 6]))
+            sig(idx:idx+9) = sig(idx:idx+9) + (0.5 + 0.9*rand)*exp(-(0:9)/3);
+        end
+    end
+end
+
+function ae = eab_trainAE(Z, H, epochs)
+    [d, n] = size(Z);
+    P = {0.1*randn(H,d), zeros(H,1), 0.1*randn(d,H), zeros(d,1)};
+    M = cellfun(@(a) zeros(size(a)), P, 'UniformOutput', false);  V = M;
+    lr = 0.005;  beta1 = 0.9;  beta2 = 0.999;
+    for t = 1:epochs
+        A  = tanh(P{1}*Z + P{2});
+        E  = (P{3}*A + P{4}) - Z;
+        dA = (P{3}'*E).*(1 - A.^2);
+        G  = {dA*Z'/n, mean(dA,2), E*A'/n, mean(E,2)};
+        for j = 1:4
+            M{j} = beta1*M{j} + (1-beta1)*G{j};
+            V{j} = beta2*V{j} + (1-beta2)*G{j}.^2;
+            P{j} = P{j} - lr*(M{j}/(1-beta1^t))./(sqrt(V{j}/(1-beta2^t)) + 1e-8);
+        end
+    end
+    ae.P = P;
+end
+
+function R = eab_reconAE(ae, Z)
+    R = ae.P{3}*tanh(ae.P{1}*Z + ae.P{2}) + ae.P{4};
+end
+
+function th = eab_pick(e, q)
+    s = sort(e);  th = s(ceil(q*numel(s)));
+end
+
+function m = eab_eval(pred, y)
+    TP = sum(pred & y);  FP = sum(pred & ~y);  FN = sum(~pred & y);
+    m.p  = TP/max(TP+FP, 1);
+    m.r  = TP/max(TP+FN, 1);
+    m.f1 = 2*m.p*m.r/max(m.p+m.r, eps);
+end
+
+function a = eab_auc(score, y)
+    [~, ord] = sort(score);  rk = zeros(size(score));  rk(ord) = 1:numel(score);
+    n1 = sum(y);  n0 = sum(~y);
+    a = (sum(rk(y)) - n1*(n1+1)/2)/(n1*n0);
+end
+
+function [fpr, tpr] = eab_roc(score, y)
+    [~, ord] = sort(score, 'descend');  ys = y(ord);
+    tpr = [0 cumsum(ys)/sum(ys)];
+    fpr = [0 cumsum(~ys)/sum(~ys)];
+end
